@@ -1,0 +1,25 @@
+{
+  "ticketService": "https://api.ticketservice.com",
+  "holdDuration": 600,
+  "extensionThreshold": 5,
+  "checkInterval": 1,
+  "retryAttempts": 3,
+  "retryDelay": 10,
+  "recoveryInterval": 5,
+  "recoveryAttempts": 10,
+  "databasePath": "data/reservations.json",
+  "events": [
+    {
+      "eventId": "123",
+      "maxPrice": 500,
+      "preferredSections": ["VIP", "Floor", "General"],
+      "numTickets": 2
+    },
+    {
+      "eventId": "456",
+      "maxPrice": 350,
+      "preferredSections": ["Orchestra", "Mezzanine"],
+      "numTickets": 4
+    }
+  ]
+}
