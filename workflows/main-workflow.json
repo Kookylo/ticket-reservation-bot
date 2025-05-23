@@ -1,0 +1,658 @@
+{
+  "name": "Ticket Reservation Bot - Main Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Start",
+      "type": "n8n-nodes-base.start",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "path": "={{$env.CONFIG_PATH || \"config/settings.json\"}}",
+        "options": {}
+      },
+      "name": "Load Config",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse the configuration file\nconst config = JSON.parse(Buffer.from($input.first().binary.data, 'base64').toString());\n\n// Set default values if not provided\nconst settings = {\n  ticketService: config.ticketService || \"https://api.ticketservice.com\",\n  eventId: config.eventId || \"123\",\n  maxPrice: config.maxPrice || 500,\n  preferredSections: config.preferredSections || [\"VIP\", \"Floor\"],\n  numTickets: config.numTickets || 1,\n  holdDuration: config.holdDuration || 600,\n  extensionThreshold: config.extensionThreshold || 5,\n  checkInterval: config.checkInterval || 1,\n  retryAttempts: config.retryAttempts || 3,\n  retryDelay: config.retryDelay || 10\n};\n\n// Store workflow run ID for tracking\nsettings.runId = $execution.id;\nsettings.startTime = new Date().toISOString();\n\nreturn settings;"
+      },
+      "name": "Process Config",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        550,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$node[\"Process Config\"].json.ticketService + \"/auth\"}}",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "nodeCredentialType": "httpBasicAuth",
+        "jsonParameters": true,
+        "requestMethod": "POST",
+        "bodyParametersJson": "{\n  \"username\": \"{{$env.TICKET_USER}}\",\n  \"password\": \"{{$env.TICKET_PASS}}\"\n}"
+      },
+      "name": "API Login",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        700,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": "={{$node[\"Process Config\"].json.retryAttempts}}",
+      "waitBetweenTries": "={{$node[\"Process Config\"].json.retryDelay}}"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract and format the authentication token\nconst response = $input.first();\n\nif (!response.json.token) {\n  throw new Error('Authentication failed: No token received');\n}\n\nreturn {\n  auth: {\n    token: response.json.token,\n    expires: response.json.expires_at || new Date(Date.now() + 3600000).toISOString(),\n  },\n  headers: {\n    Authorization: 'Bearer ' + response.json.token,\n    'Content-Type': 'application/json'\n  },\n  config: $node[\"Process Config\"].json\n};"
+      },
+      "name": "Process Auth",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        850,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$node[\"Process Auth\"].json.config.ticketService + \"/events/\" + $node[\"Process Auth\"].json.config.eventId + \"/seats\"}}",
+        "options": {
+          "timeout": 10000
+        },
+        "headers": "={{$node[\"Process Auth\"].json.headers}}",
+        "requestMethod": "GET"
+      },
+      "name": "Find Available Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        1000,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": "={{$node[\"Process Config\"].json.retryAttempts}}",
+      "waitBetweenTries": "={{$node[\"Process Config\"].json.retryDelay}}"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$input.first().json && Array.isArray($input.first().json) && $input.first().json.length > 0}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "Tickets Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1150,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get configuration from auth node\nconst config = $node[\"Process Auth\"].json.config;\n\n// Get available tickets\nconst availableTickets = $input.first().json;\n\n// Filter tickets based on preferences\nlet filteredTickets = availableTickets.filter(ticket => {\n  // Check price constraint\n  if (ticket.price > config.maxPrice) {\n    return false;\n  }\n  \n  // Preferred section if specified\n  if (config.preferredSections && config.preferredSections.length > 0) {\n    return config.preferredSections.includes(ticket.section);\n  }\n  \n  return true;\n});\n\n// Sort by preference and price\nfilteredTickets.sort((a, b) => {\n  // First by preferred section order\n  if (config.preferredSections) {\n    const aIndex = config.preferredSections.indexOf(a.section);\n    const bIndex = config.preferredSections.indexOf(b.section);\n    \n    if (aIndex !== bIndex) {\n      // Lower index (higher preference) comes first\n      return aIndex - bIndex;\n    }\n  }\n  \n  // Then by price (lower price first)\n  return a.price - b.price;\n});\n\n// Get the requested number of tickets\nconst selectedTickets = filteredTickets.slice(0, config.numTickets);\n\n// Return selection info\nreturn {\n  selectedTickets,\n  totalFound: availableTickets.length,\n  totalFiltered: filteredTickets.length,\n  config: config,\n  auth: $node[\"Process Auth\"].json.auth,\n  headers: $node[\"Process Auth\"].json.headers\n};"
+      },
+      "name": "Select Best Tickets",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByPosition",
+        "value": "={{$item(0).$node[\"Process Auth\"].json}}",
+        "options": {}
+      },
+      "name": "No Tickets Available",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$node[\"Process Auth\"].json.config.ticketService + \"/reserve\"}}",
+        "options": {
+          "timeout": 10000
+        },
+        "headers": "={{$node[\"Select Best Tickets\"].json.headers}}",
+        "jsonParameters": true,
+        "requestMethod": "POST",
+        "bodyParametersJson": "={{{\n  \"seat_ids\": $node[\"Select Best Tickets\"].json.selectedTickets.map(ticket => ticket.id),\n  \"hold_duration\": $node[\"Select Best Tickets\"].json.config.holdDuration\n}}}"
+      },
+      "name": "Reserve Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        1450,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": "={{$node[\"Process Config\"].json.retryAttempts}}",
+      "waitBetweenTries": "={{$node[\"Process Config\"].json.retryDelay}}"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Combine all the important information\nconst reservationData = $input.first().json;\nconst ticketInfo = $node[\"Select Best Tickets\"].json;\n\nreturn {\n  reservationId: reservationData.reservation_id,\n  selectedTickets: ticketInfo.selectedTickets,\n  expiresAt: reservationData.expires_at,\n  holdDuration: ticketInfo.config.holdDuration,\n  extensionThreshold: ticketInfo.config.extensionThreshold,\n  checkInterval: ticketInfo.config.checkInterval,\n  config: ticketInfo.config,\n  auth: ticketInfo.auth,\n  headers: ticketInfo.headers,\n  lastChecked: new Date().toISOString(),\n  extensions: 0\n};"
+      },
+      "name": "Process Reservation",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1600,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "={{\"## Ticket Reservation Created\\n\\n- Reservation ID: \" + $node[\"Process Reservation\"].json.reservationId + \"\\n- Tickets: \" + $node[\"Process Reservation\"].json.selectedTickets.length + \"\\n- Expires: \" + $node[\"Process Reservation\"].json.expiresAt + \"\\n- Sections: \" + $node[\"Process Reservation\"].json.selectedTickets.map(t => t.section).join(\", \") + \"\\n- Total Price: $\" + $node[\"Process Reservation\"].json.selectedTickets.reduce((sum, t) => sum + t.price, 0)}}",
+        "attachments": [],
+        "additionalFields": {
+          "username": "Ticket Bot"
+        }
+      },
+      "name": "Send Success Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [
+        1750,
+        100
+      ],
+      "credentials": {
+        "slackApi": "="
+      }
+    },
+    {
+      "parameters": {
+        "unit": "minutes",
+        "value": "={{$node[\"Process Reservation\"].json.checkInterval || 1}}"
+      },
+      "name": "Monitoring Interval",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        1750,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$node[\"Process Reservation\"].json.config.ticketService + \"/reservation/\" + $node[\"Process Reservation\"].json.reservationId}}",
+        "options": {
+          "timeout": 10000
+        },
+        "headers": "={{$node[\"Process Reservation\"].json.headers}}",
+        "requestMethod": "GET"
+      },
+      "name": "Check Reservation Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        1900,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": "={{$node[\"Process Reservation\"].json.config.retryAttempts}}",
+      "waitBetweenTries": "={{$node[\"Process Reservation\"].json.config.retryDelay}}"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get the current reservation data\nconst reservation = $input.first().json;\nconst prevData = $node[\"Process Reservation\"].json;\n\n// Calculate minutes until expiration\nconst expiresAt = new Date(reservation.expires_at);\nconst now = new Date();\nconst minutesRemaining = (expiresAt - now) / 60000;\n\n// Update the monitoring data\nreturn {\n  ...prevData,\n  expiresAt: reservation.expires_at,\n  minutesRemaining: minutesRemaining,\n  lastChecked: new Date().toISOString(),\n  status: reservation.status\n};"
+      },
+      "name": "Update Status",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2050,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$node[\"Update Status\"].json.minutesRemaining}}",
+              "operation": "smaller",
+              "value2": "={{$node[\"Update Status\"].json.extensionThreshold}}"
+            }
+          ]
+        }
+      },
+      "name": "Need Extension?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$node[\"Update Status\"].json.config.ticketService + \"/reservation/\" + $node[\"Update Status\"].json.reservationId + \"/extend\"}}",
+        "options": {
+          "timeout": 10000
+        },
+        "headers": "={{$node[\"Update Status\"].json.headers}}",
+        "jsonParameters": true,
+        "requestMethod": "POST",
+        "bodyParametersJson": "{\n  \"duration\": {{$node[\"Update Status\"].json.holdDuration}}\n}"
+      },
+      "name": "Extend Reservation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [
+        2350,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": "={{$node[\"Update Status\"].json.config.retryAttempts}}",
+      "waitBetweenTries": "={{$node[\"Update Status\"].json.config.retryDelay}}"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Update the reservation data after extension\nconst extendResponse = $input.first().json;\nconst prevData = $node[\"Update Status\"].json;\n\n// Calculate new expiration time\nconst newExpiresAt = extendResponse.expires_at || new Date(Date.now() + (prevData.holdDuration * 1000)).toISOString();\n\nreturn {\n  ...prevData,\n  expiresAt: newExpiresAt,\n  extensions: prevData.extensions + 1,\n  lastExtended: new Date().toISOString()\n};"
+      },
+      "name": "Process Extension",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2500,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "={{\"## Ticket Reservation Extended\\n\\n- Reservation ID: \" + $node[\"Process Extension\"].json.reservationId + \"\\n- New Expiration: \" + $node[\"Process Extension\"].json.expiresAt + \"\\n- Extension Count: \" + $node[\"Process Extension\"].json.extensions + \"\\n- Minutes Remaining: \" + Math.round($node[\"Process Extension\"].json.minutesRemaining + $node[\"Process Extension\"].json.holdDuration/60)}}",
+        "attachments": [],
+        "additionalFields": {
+          "username": "Ticket Bot"
+        }
+      },
+      "name": "Send Extension Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [
+        2650,
+        200
+      ],
+      "credentials": {
+        "slackApi": "="
+      }
+    },
+    {
+      "parameters": {
+        "content": "={{\"## Ticket Reservation Status\\n\\n- Reservation ID: \" + $node[\"Update Status\"].json.reservationId + \"\\n- Status: \" + $node[\"Update Status\"].json.status + \"\\n- Expires: \" + $node[\"Update Status\"].json.expiresAt + \"\\n- Minutes Remaining: \" + Math.round($node[\"Update Status\"].json.minutesRemaining) + \"\\n- Extensions: \" + $node[\"Update Status\"].json.extensions}}",
+        "attachments": [],
+        "additionalFields": {
+          "username": "Ticket Bot"
+        }
+      },
+      "name": "Send Status Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [
+        2350,
+        400
+      ],
+      "credentials": {
+        "slackApi": "="
+      }
+    },
+    {
+      "parameters": {
+        "content": "={{\"## No Tickets Available\\n\\n- Event ID: \" + $node[\"No Tickets Available\"].json.config.eventId + \"\\n- Time: \" + new Date().toISOString() + \"\\n- Will retry at next interval\"}}",
+        "attachments": [],
+        "additionalFields": {
+          "username": "Ticket Bot"
+        }
+      },
+      "name": "Send No Tickets Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [
+        1450,
+        400
+      ],
+      "credentials": {
+        "slackApi": "="
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [],
+          "string": [
+            {
+              "value1": "={{$node[\"Update Status\"].json.status}}",
+              "value2": "ACTIVE"
+            }
+          ]
+        }
+      },
+      "name": "Is Reservation Active?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "unit": "minutes",
+        "value": "={{$node[\"Process Config\"].json.checkInterval || 1}}"
+      },
+      "name": "Retry Interval",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        1600,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Load Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Config": {
+      "main": [
+        [
+          {
+            "node": "Process Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Config": {
+      "main": [
+        [
+          {
+            "node": "API Login",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API Login": {
+      "main": [
+        [
+          {
+            "node": "Process Auth",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Auth": {
+      "main": [
+        [
+          {
+            "node": "Find Available Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Available Tickets": {
+      "main": [
+        [
+          {
+            "node": "Tickets Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tickets Available?": {
+      "main": [
+        [
+          {
+            "node": "Select Best Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Tickets Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Best Tickets": {
+      "main": [
+        [
+          {
+            "node": "Reserve Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Tickets Available": {
+      "main": [
+        [
+          {
+            "node": "Send No Tickets Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserve Tickets": {
+      "main": [
+        [
+          {
+            "node": "Process Reservation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Reservation": {
+      "main": [
+        [
+          {
+            "node": "Send Success Notification",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Monitoring Interval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monitoring Interval": {
+      "main": [
+        [
+          {
+            "node": "Check Reservation Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Reservation Status": {
+      "main": [
+        [
+          {
+            "node": "Update Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Status": {
+      "main": [
+        [
+          {
+            "node": "Need Extension?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need Extension?": {
+      "main": [
+        [
+          {
+            "node": "Extend Reservation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Status Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extend Reservation": {
+      "main": [
+        [
+          {
+            "node": "Process Extension",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Extension": {
+      "main": [
+        [
+          {
+            "node": "Send Extension Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Extension Notification": {
+      "main": [
+        [
+          {
+            "node": "Is Reservation Active?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Status Notification": {
+      "main": [
+        [
+          {
+            "node": "Is Reservation Active?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send No Tickets Notification": {
+      "main": [
+        [
+          {
+            "node": "Retry Interval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Reservation Active?": {
+      "main": [
+        [
+          {
+            "node": "Monitoring Interval",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Interval": {
+      "main": [
+        [
+          {
+            "node": "API Login",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
